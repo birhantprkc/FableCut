@@ -3575,19 +3575,15 @@ function routeClipGain(c) {
 }
 
 /* ── Per-track meters: RMS / LUFS-M / Peak (AudioWorklet) ── */
-const METER_SEGS = 16;
+const METER_SEGS = 20;
 const METER_DB_MIN = -48;
 const METER_DB_MAX = 0;
 /** Scale tick marks shown beside the meter bars (dBFS). */
 const METER_DB_MARKS = [0, -6, -12, -24, -36, -48];
 const METER_MODES = ["rms", "lufs", "peak"];
 const METER_MODE_LABEL = { rms: "RMS", lufs: "LUFS", peak: "PEAK" };
-/* Each channel's segment ladder is one <canvas> instead of METER_SEGS separate
-   DOM nodes (was up to 16 tracks × 16 <div>s = 256 live elements, all touched
-   via classList every time the reading changed). Geometry matches the old
-   flex layout: 16 × 12px segments, 2px gaps, column-reverse (index 0 = bottom
-   = quietest). */
-const METER_SEG_W = 8, METER_SEG_H = 12, METER_SEG_GAP = 2;
+/* Each channel's segment ladder is one <canvas>  - index 0 = bottom = quietest. */
+const METER_SEG_W = 10, METER_SEG_H = 10, METER_SEG_GAP = 1;
 const METER_COL_W = METER_SEG_W;
 const METER_COL_H = METER_SEGS * METER_SEG_H + (METER_SEGS - 1) * METER_SEG_GAP;
 function makeMeterCanvas(cv) {
@@ -3800,29 +3796,36 @@ function updateMeterUI(dt) {
   const attack = 1 - Math.exp(-dt / atkMs);
   const release = 1 - Math.exp(-dt / relMs);
   const now = performance.now();
+  const floorEps = (METER_DB_MAX - METER_DB_MIN) / (METER_SEGS * 2);
   for (const id of ids) {
     const target = metering ? meterReadingDb(id) : METER_DB_MIN;
     const cur = meterState.disp[id] ?? METER_DB_MIN;
     const a = target > cur ? attack : release;
-    const next = cur + (target - cur) * a;
+    let next = cur + (target - cur) * a;
+    if (next <= METER_DB_MIN + floorEps) next = METER_DB_MIN;
     meterState.disp[id] = next;
 
     // Hold tip follows the active mode reading (not always sample-peak)
     const pk = target;
-    if (pk >= (meterState.peakHold[id] ?? METER_DB_MIN)) {
+    if (pk > (meterState.peakHold[id] ?? METER_DB_MIN)) {
       meterState.peakHold[id] = pk;
       meterState.peakHoldT[id] = now;
     } else if (now - (meterState.peakHoldT[id] || 0) > 800) {
       meterState.peakHold[id] += (METER_DB_MIN - meterState.peakHold[id]) * release;
+      if (meterState.peakHold[id] <= METER_DB_MIN + floorEps)
+        meterState.peakHold[id] = METER_DB_MIN;
     }
 
     const segs = meterState.segs[id];
     if (!segs) continue;
     const level = (next - METER_DB_MIN) / (METER_DB_MAX - METER_DB_MIN);
-    const lit = Math.round(clamp(level, 0, 1) * METER_SEGS);
-    const hold = Math.round(clamp(
+    const lit = next <= METER_DB_MIN ? 0 : Math.round(clamp(level, 0, 1) * METER_SEGS);
+    const holdN = clamp(
       ((meterState.peakHold[id] ?? METER_DB_MIN) - METER_DB_MIN) / (METER_DB_MAX - METER_DB_MIN), 0, 1
-    ) * (METER_SEGS - 1));
+    );
+    // Empty bar → no hold tick (including a leftover positive hold index).
+    let hold = holdN <= 0 ? -1 : Math.round(holdN * (METER_SEGS - 1));
+    if (lit === 0) hold = -1;
     // The ballistics above still run every frame (needed for smooth decay),
     // but the canvas only needs repainting when the result actually differs —
     // skips a redraw for most tracks most frames.

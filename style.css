@@ -722,6 +722,9 @@ body.track-size-s .clip.selected {
   align-items: center;
   justify-content: center;
   overflow: hidden;
+  /* Below monitor chrome (VU, keyframe graphs) so the export-frame shade
+     cannot dim them. Flex item z-index is enough — no position needed. */
+  z-index: 1;
 }
 
 .monitor-scroll.is-zoomed {
@@ -848,7 +851,7 @@ body.track-size-s .clip.selected {
   flex-direction: column;
   align-items: stretch;
   gap: 4px;
-  z-index: 4;
+  z-index: 7;
   pointer-events: auto;
   padding: 5px 5px 4px;
   background: #000a;
