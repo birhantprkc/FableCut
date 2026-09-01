@@ -7,13 +7,14 @@
 
    Tools: fablecut_status, fablecut_docs, fablecut_get_project,
           fablecut_set_project, fablecut_patch_project, fablecut_import_media,
-          fablecut_analyze_reference
+          fablecut_analyze_reference, fablecut_encode_profiles
    ═══════════════════════════════════════════════════════════════════════════ */
 "use strict";
 const fs = require("fs");
 const path = require("path");
 const http = require("http");
 const { spawn, spawnSync } = require("child_process");
+const { loadEncodeProfiles, listProfilesPublic, resolveProfile, profileSummary } = require("./encode-profiles");
 
 const {
   APP_DIR, DATA_DIR, MEDIA_DIR, ANALYSIS_DIR, LIBRARY_DIR, PROJECT_FILE, ensureDirs,
@@ -108,7 +109,7 @@ const TOOLS = [
   },
   {
     name: "fablecut_patch_project",
-    description: "Apply targeted edits to the FableCut project WITHOUT round-tripping the whole document — PREFER THIS over get+set for every edit (it is ~10-100x cheaper in tokens and merge-safe by design: it re-reads the latest document from disk, applies your ops in order, bumps revision once, saves atomically). Ops: {op:'addClip', clip:{…}} (id auto-generated if omitted) · {op:'updateClip', id, set:{…}} · {op:'removeClip', id} · {op:'addMedia', media:{…}} · {op:'removeMedia', id} · {op:'setProject', set:{name|width|height|fps|background|markers|disabledTracks}}. updateClip merge rules: top-level keys are replaced (keyframes/transitionIn/transitionOut wholesale), `props` merges key-by-key, and setting any key to null deletes it. All-or-nothing: an invalid op aborts the whole patch unsaved.",
+    description: "Apply targeted edits to the FableCut project WITHOUT round-tripping the whole document — PREFER THIS over get+set for every edit (it is ~10-100x cheaper in tokens and merge-safe by design: it re-reads the latest document from disk, applies your ops in order, bumps revision once, saves atomically). Ops: {op:'addClip', clip:{…}} (id auto-generated if omitted) · {op:'updateClip', id, set:{…}} · {op:'removeClip', id} · {op:'addMedia', media:{…}} · {op:'removeMedia', id} · {op:'setProject', set:{name|width|height|fps|background|markers|disabledTracks|encodeProfile}}. updateClip merge rules: top-level keys are replaced (keyframes/transitionIn/transitionOut wholesale), `props` merges key-by-key, and setting any key to null deletes it. All-or-nothing: an invalid op aborts the whole patch unsaved.",
     inputSchema: {
       type: "object",
       properties: {
@@ -155,6 +156,17 @@ const TOOLS = [
       required: ["path"],
     },
   },
+  {
+    name: "fablecut_encode_profiles",
+    description: "List ffmpeg encoding profiles for Fast export (from encoding-profiles.json). Each profile is a raw ffmpeg argument list plus jpegQuality, extension, and optional color (output matrix/range — default BT.709 tv). Use to pick a profile id for project.encodeProfile. Edit encoding-profiles.json on disk to add custom profiles — anything the local ffmpeg supports works, and the server hot-reloads the file. Profiles are dry-run against ffmpeg when an export starts, so a bad argument is rejected before rendering.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        detail: { type: "boolean", description: "Include the full ffmpeg args array per profile (default: a truncated summary)" },
+        profile: { type: "string", description: "Return one profile by id instead of the full list" },
+      },
+    },
+  },
 ];
 
 /* ── Tool implementations ── */
@@ -173,14 +185,32 @@ async function callTool(name, args) {
         return `${d}: ${n}`;
       }).join(", ");
       const cap = (arr, n) => arr.length > n ? arr.slice(0, n).concat(`… +${arr.length - n} more`) : arr;
+      let encLine = "";
+      try {
+        const cfg = loadEncodeProfiles();
+        const describe = (id) => {
+          const p = cfg.profiles[id];
+          return p ? `${id} (${p.label}) — ${profileSummary(p)}` : null;
+        };
+        const pinned = proj.encodeProfile;
+        if (pinned && !cfg.profiles[pinned]) {
+          /* a project pinning a since-deleted profile must not read as "nothing
+             configured" — the bad id and the fallback are two separate facts */
+          encLine = `Export profile: project encodeProfile "${pinned}" is NOT DEFINED in encoding-profiles.json` +
+            ` — falling back to default ${describe(cfg.default) || `"${cfg.default}"`}`;
+        } else {
+          encLine = `Export profile: ${describe(pinned || cfg.default) || `server default "${cfg.default}"`}`;
+        }
+      } catch { encLine = "Export profile: (encoding-profiles.json unavailable)"; }
       return [
         `Editor server: ${up ? "RUNNING — open " + BASE + " in a browser to watch edits live" : "FAILED TO START (check node / port " + PORT + ")"}`,
         `Project: "${proj.name}" — ${proj.width}x${proj.height} @ ${proj.fps}fps, ${proj.clips.length} clip(s), ${dur.toFixed(2)}s, revision ${proj.revision}`,
+        encLine,
         `Registered media: ${cap(proj.media.map((m) => `${m.id} (${m.kind}, ${m.name}${m.duration ? ", " + m.duration + "s" : ""})`), 25).join("; ") || "none"}`,
         `Files in media/: ${cap(files, 25).join(", ") || "none"}`,
         `Library assets (./library): ${libSummary}`,
         `Project file: ${PROJECT_FILE}`,
-        `Tips: fablecut_docs (use \`section\`) for the schema · fablecut_get_project {compact:true} to see the timeline · fablecut_patch_project for edits (cheapest).`,
+        `Tips: fablecut_docs (use \`section\`) for the schema · fablecut_get_project {compact:true} to see the timeline · fablecut_patch_project for edits (cheapest) · fablecut_encode_profiles for export presets.`,
       ].join("\n");
     }
     case "fablecut_docs": {
@@ -311,9 +341,12 @@ async function callTool(name, args) {
             break;
           }
           case "setProject": {
-            const allowed = ["name", "width", "height", "fps", "background", "markers", "disabledTracks", "exportFrame"];
+            const allowed = ["name", "width", "height", "fps", "background", "markers", "disabledTracks", "exportFrame", "encodeProfile"];
             for (const [k, v] of Object.entries(op.set || {})) {
               if (!allowed.includes(k)) throw new Error(`setProject: '${k}' not settable (allowed: ${allowed.join(", ")})`);
+              if (k === "encodeProfile" && v != null) {
+                resolveProfile(String(v)); // validate id exists
+              }
               if (v === null) delete proj[k]; else proj[k] = v;
             }
             notes.push("~project");
@@ -445,6 +478,22 @@ async function callTool(name, args) {
         (entry.duration == null && kind !== "image"
           ? "Note: duration unknown (no ffprobe). The browser UI will probe and fill it in; re-read the project before trimming this media."
           : "Ready to use in clips via mediaId.");
+    }
+    case "fablecut_encode_profiles": {
+      if (args.profile) {
+        const p = resolveProfile(String(args.profile));
+        return JSON.stringify({
+          default: loadEncodeProfiles().default,
+          profile: args.profile,
+          label: p.label,
+          description: p.description,
+          jpegQuality: p.jpegQuality,
+          extension: p.extension,
+          color: p.color,
+          args: p.args,
+        }, null, 2);
+      }
+      return JSON.stringify(listProfilesPublic(!!args.detail), null, 2);
     }
     default:
       throw new Error("Unknown tool: " + name);

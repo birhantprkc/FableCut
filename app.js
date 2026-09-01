@@ -205,6 +205,7 @@ function addLiveAudioTrackBuses(ids) {
 const SETTINGS_KEY = "fablecut-settings";
 const DEFAULT_SETTINGS = {
   linkSelect: false, // timeline ↔ project bin selection sync
+  encodeProfile: null, // null = server default from encoding-profiles.json
 };
 let settings = { ...DEFAULT_SETTINGS };
 function loadSettings() {
@@ -246,6 +247,7 @@ const project = {
   outPoint: null, // timeline work-area OUT (seconds), or null
   disabledTracks: [], // track ids (V4…A3) hidden from preview/export when listed
   exportFrame: null, // optional {x,y,w,h} delivery crop inside width×height canvas
+  encodeProfile: null, // optional fast-export profile id (overrides browser setting)
 };
 const state = {
   time: 0, playing: false, pps: 60, snap: true,
@@ -340,6 +342,9 @@ const els = {
   monitorStage: $("monitorStage"), monitorScroll: $("monitorScroll"),
   monitorZoomInner: $("monitorZoomInner"), kfGraphs: $("kfGraphs"),
   exportSetup: $("exportSetup"), engineFast: $("engineFast"), engineRealtime: $("engineRealtime"),
+  exportProfileRow: $("exportProfileRow"),
+  exportProfileSel: $("exportProfileSel"), exportProfileNote: $("exportProfileNote"),
+  exportProfileHint: $("exportProfileHint"),
 };
 const ctx2d = els.preview.getContext("2d");
 
@@ -458,6 +463,7 @@ async function connectServer() {
     listenSSE();
     fetch("/api/export/ffmpeg").then((r) => r.json())
       .then((j) => { state.ffmpeg = !!j.available; }).catch(() => { });
+    fetchEncodeProfiles();
   } catch {
     state.connected = false;
     els.projectName.textContent = project.name + "  ·  ⚪ local session";
@@ -669,6 +675,7 @@ function applyProject(data) {
     outPoint: wa.outPoint,
     disabledTracks,
     exportFrame: normalizeExportFrame(data.exportFrame, data.width || 1280, data.height || 720),
+    encodeProfile: data.encodeProfile || null,
   });
   const folderIds = new Set(project.folders.map((f) => f.id));
   for (const m of project.media) {
@@ -730,7 +737,7 @@ function scheduleSave() {
   }, 400);
 }
 function projectJSON() {
-  const { name, width, height, fps, background, revision, folders, media, clips, markers, inPoint, outPoint, disabledTracks, exportFrame } = project;
+  const { name, width, height, fps, background, revision, folders, media, clips, markers, inPoint, outPoint, disabledTracks, encodeProfile } = project;
   const out = {
     name, width, height, fps, background, revision,
     folders: (folders || []).map(({ id, name, parentId, open }) =>
@@ -738,10 +745,10 @@ function projectJSON() {
     media: media.filter((m) => !m.transient).map(({ id, name, kind, src, duration, width, height, folderId }) =>
       ({ id, name, kind, src, duration, width, height, folderId: folderId || null })),
     clips: clips.map(({ id, mediaId, kind, track, start, in: inn, duration, name, props, keyframes, transitionIn, transitionOut, linkedId, linkGroup }) => {
-      const out = { id, mediaId, kind, track, start, in: inn, duration, name, props, keyframes, transitionIn, transitionOut };
-      if (linkGroup) out.linkGroup = linkGroup;
-      if (linkedId) out.linkedId = linkedId;
-      return out;
+      const clipOut = { id, mediaId, kind, track, start, in: inn, duration, name, props, keyframes, transitionIn, transitionOut };
+      if (linkGroup) clipOut.linkGroup = linkGroup;
+      if (linkedId) clipOut.linkedId = linkedId;
+      return clipOut;
     }),
     markers: (markers || []).map(({ t, label }) => (label ? { t, label } : { t })),
     inPoint: inPoint == null ? null : inPoint,
@@ -750,10 +757,20 @@ function projectJSON() {
   };
   const ef = getExportFrame();
   if (ef) out.exportFrame = ef;
+  if (encodeProfile) out.encodeProfile = encodeProfile;
   return out;
 }
 function listenSSE() {
   const es = new EventSource("/api/events");
+  // Named events: "change" = project/media/library; "profiles" = encoding-profiles.json only
+  es.addEventListener("change", () => syncFromServer());
+  es.addEventListener("profiles", () => {
+    fetchEncodeProfiles().then(() => {
+      if (els.exportSetup && !els.exportSetup.classList.contains("hidden"))
+        populateExportProfileSelect();
+    });
+  });
+  // Legacy default "message" events (old servers that emit bare `data:`)
   es.onmessage = () => syncFromServer();
 }
 /* Pull the server's project if it moved past our revision (an external tool —
@@ -765,6 +782,7 @@ async function syncFromServer(force) {
   runtime.pendingSync = false;
   if (state.binTab !== "project") fetchLibrary(state.binTab).then(renderLibrary);
   loadLibraryFonts();
+  fetchEncodeProfiles();
   try {
     const res = await fetch("/api/project", { cache: "no-store" });
     if (!res.ok) return;
@@ -5291,9 +5309,89 @@ function loop(ts) {
 /* Two engines:
    – fast: the browser renders every frame with the normal compositor
      (frame-accurate, works unfocused) and streams JPEGs + an offline audio
-     mix to the server, where ffmpeg encodes a real CRF-18 MP4.
+     mix to the server, where ffmpeg encodes via an encoding profile.
    – realtime: the original MediaRecorder capture, kept as the fallback for
      local sessions / servers without ffmpeg. */
+
+/* Placeholder until /api/export/profiles answers — the real list (and the real
+   ffmpeg args) always comes from encoding-profiles.json on the server. */
+let encodeProfiles = {
+  default: "delivery",
+  profiles: {
+    draft: {
+      label: "Draft · H.264 fast",
+      description: "Quick preview — smaller file, faster encode.",
+      summary: "-c:v libx264 -preset veryfast -crf 23 -c:a aac -b:a 128k",
+      jpegQuality: 0.85,
+    },
+    delivery: {
+      label: "Delivery · H.264 balanced",
+      description: "Default export — good quality and compatibility.",
+      summary: "-c:v libx264 -preset fast -crf 18 -c:a aac -b:a 192k",
+      jpegQuality: 0.95,
+    },
+    hq: {
+      label: "High quality · H.264 slow",
+      description: "Best H.264 quality — slower encode, larger file.",
+      summary: "-c:v libx264 -preset slow -crf 16 -c:a aac -b:a 256k",
+      jpegQuality: 0.98,
+    },
+  },
+};
+
+async function fetchEncodeProfiles() {
+  if (!state.connected) return;
+  try {
+    const r = await fetch("/api/export/profiles", { cache: "no-store" });
+    if (!r.ok) return;
+    const data = await r.json();
+    if (data?.profiles && Object.keys(data.profiles).length) encodeProfiles = data;
+  } catch { }
+}
+function effectiveEncodeProfileId() {
+  return project.encodeProfile || getSetting("encodeProfile") || encodeProfiles.default || "delivery";
+}
+function exportProfileMeta(id) {
+  return encodeProfiles.profiles[id] || { label: id, summary: id, jpegQuality: 0.95 };
+}
+function updateExportProfileNote(id) {
+  const known = Object.hasOwn(encodeProfiles.profiles, id);
+  const p = exportProfileMeta(id);
+  if (els.exportProfileNote) {
+    els.exportProfileNote.textContent = known
+      ? [p.description, p.summary].filter(Boolean).join(" — ")
+      : `"${id}" is not defined in encoding-profiles.json — the export will fail until it is added or another profile is picked.`;
+  }
+  if (els.exportProfileHint) {
+    if (project.encodeProfile) {
+      els.exportProfileHint.textContent =
+        "Project default (encodeProfile in project.json). Pick another profile here for a one-off export.";
+    } else if (getSetting("encodeProfile")) {
+      els.exportProfileHint.textContent = "Browser default — saved when you change this dropdown.";
+    } else {
+      els.exportProfileHint.textContent = "Using server default from encoding-profiles.json.";
+    }
+  }
+}
+function populateExportProfileSelect() {
+  if (!els.exportProfileSel) return;
+  const ids = Object.keys(encodeProfiles.profiles);
+  const cur = effectiveEncodeProfileId();
+  // a project/browser default naming a deleted profile must stay visible rather
+  // than silently falling through to whichever option happens to be first
+  if (cur && !ids.includes(cur)) ids.unshift(cur);
+  els.exportProfileSel.innerHTML = ids.map((id) => {
+    const p = encodeProfiles.profiles[id];
+    const sel = id === cur ? " selected" : "";
+    const label = p ? (p.label || id) : `${id} (not defined on the server)`;
+    return `<option value="${escapeHtml(id)}"${sel}>${escapeHtml(label)}</option>`;
+  }).join("");
+  updateExportProfileNote(els.exportProfileSel.value || cur || "delivery");
+}
+function syncExportProfileVisibility() {
+  const show = els.engineFast.checked && !els.engineFast.disabled;
+  els.exportProfileRow?.classList.toggle("hidden", !show);
+}
 
 function openExportSetup() {
   if (state.exporting) return;
@@ -5340,7 +5438,11 @@ function openExportSetup() {
     warn.textContent = "";
     warn.classList.add("hidden");
   }
-  els.exportSetup.classList.remove("hidden");
+  syncExportProfileVisibility();
+  fetchEncodeProfiles().then(() => {
+    populateExportProfileSelect();
+    els.exportSetup.classList.remove("hidden");
+  });
 }
 function startChosenExport() {
   const useFast = els.engineFast.checked && !els.engineFast.disabled;
@@ -5473,8 +5575,18 @@ async function fastExport() {
     els.exportTitle.textContent = "Mixing audio…";
     const wav = await renderAudioMix(dur);
     if (renderCancelled) throw new Error("cancelled");
+    const profileId = els.exportProfileSel?.value || effectiveEncodeProfileId();
+    const jpegQ = exportProfileMeta(profileId).jpegQuality ?? 0.95;
     const begin = await fetch("/api/export/begin", {
-      method: "POST", body: JSON.stringify({ fps, name: project.name.replace(/[^\w\- ]+/g, "") || "export" }),
+      method: "POST",
+      body: JSON.stringify({
+        fps,
+        name: project.name.replace(/[^\w\- ]+/g, "") || "export",
+        profile: profileId,
+        // lets the server dry-run the profile with the same input count we
+        // will actually feed it, so -map based profiles are checked correctly
+        hasAudio: !!wav,
+      }),
     }).then((r) => r.json());
     if (!begin.id) throw new Error(begin.error || "export begin failed");
     sessId = begin.id;
@@ -5490,7 +5602,7 @@ async function fastExport() {
       await seekVideosTo(t);
       await prepareFrameAssets(t);       // exact SVG frames + AI masks
       drawFrame(t);
-      const blob = await previewToExportBlob(0.95);
+      const blob = await previewToExportBlob(jpegQ);
       const r = await fetch("/api/export/frame?id=" + sessId, { method: "POST", body: blob });
       if (!r.ok) throw new Error((await r.json()).error || "frame upload failed");
       const pct = ((f + 1) / frames) * 100;
@@ -5589,6 +5701,16 @@ $("btnDelete").addEventListener("click", () => {
 });
 $("btnExport").addEventListener("click", openExportSetup);
 $("btnStartExport").addEventListener("click", startChosenExport);
+els.exportSetup?.addEventListener("change", (e) => {
+  if (e.target.name === "engine") syncExportProfileVisibility();
+});
+els.exportProfileSel?.addEventListener("change", (e) => {
+  const id = e.target.value;
+  if (!project.encodeProfile) {
+    setSetting("encodeProfile", id === encodeProfiles.default ? null : id);
+  }
+  updateExportProfileNote(id);
+});
 $("btnCancelSetup").addEventListener("click", () => els.exportSetup.classList.add("hidden"));
 $("btnCancelExport").addEventListener("click", () => {
   if (state.rendering) renderCancelled = true;

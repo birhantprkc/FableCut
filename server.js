@@ -5,8 +5,10 @@
    Adds to the browser editor:
      • persistent project      ./project.json      (GET/PUT /api/project)
      • media library folder    ./media/            (served at /media/*, POST /api/upload)
-     • live reload             GET /api/events     (SSE; fires when project.json
-                                                    or ./media changes on disk)
+     • live reload             GET /api/events     (SSE: event "change" for
+                                                    project/media/library;
+                                                    event "profiles" for
+                                                    encoding-profiles.json)
 
    Automation: any tool (e.g. Claude Code) can edit project.json or drop files
    into ./media — the browser UI reloads instantly. Schema: see CLAUDE.md.
@@ -19,6 +21,16 @@ const os = require("os");
 const { spawn, spawnSync, execFile } = require("child_process");
 
 const { analyze } = require("./analyze");
+const {
+  PROFILES_FILE,
+  loadEncodeProfiles,
+  invalidateEncodeProfiles,
+  resolveProfile,
+  listProfilesPublic,
+  profileSummary,
+  buildExportArgs,
+  dryRunProfile,
+} = require("./encode-profiles");
 
 const {
   APP_DIR, DATA_DIR, MEDIA_DIR, EXPORTS_DIR, ANALYSIS_DIR, LIBRARY_DIR,
@@ -82,17 +94,29 @@ if (!fs.existsSync(PROJECT_FILE)) {
 
 /* ── SSE clients + file watching ── */
 const sseClients = new Set();
-function broadcast() {
-  for (const res of sseClients) res.write(`data: change\n\n`);
+function broadcast(event = "change") {
+  const payload = `event: ${event}\ndata: ${event}\n\n`;
+  for (const res of sseClients) res.write(payload);
 }
 let debounce = null;
+let profilesDebounce = null;
 function onFsChange() {
   clearTimeout(debounce);
-  debounce = setTimeout(broadcast, 150);
+  debounce = setTimeout(() => broadcast("change"), 150);
+}
+function onProfilesChange() {
+  invalidateEncodeProfiles();
+  clearTimeout(profilesDebounce);
+  profilesDebounce = setTimeout(() => broadcast("profiles"), 150);
 }
 /* watch the directory, not the file — atomic tmp+rename writes would detach a
    direct file watcher on Windows */
 try { fs.watch(DATA_DIR, (ev, f) => { if (f === "project.json") onFsChange(); }); } catch {}
+try {
+  fs.watch(ROOT, (ev, f) => {
+    if (f === path.basename(PROFILES_FILE)) onProfilesChange();
+  });
+} catch {}
 try { fs.watch(MEDIA_DIR, onFsChange); } catch {}
 for (const d of LIBRARY_SUBDIRS) {
   try { fs.watch(path.join(LIBRARY_DIR, d), onFsChange); } catch {}
@@ -115,12 +139,29 @@ function readBody(req) {
     req.on("error", reject);
   });
 }
-function uniquePath(dir, name) {
-  let target = path.join(dir, name);
-  const ext = path.extname(name), base = path.basename(name, ext);
-  let i = 1;
-  while (fs.existsSync(target)) target = path.join(dir, `${base}_${i++}${ext}`);
-  return target;
+/** Claim final + sibling `.part` paths with exclusive create (`wx`) so concurrent
+ *  exports cannot pick the same free name before either file exists. */
+function reserveExportPaths(dir, baseName, ext) {
+  const base = baseName.replace(/\.(mp4|mov|m4v|mkv|webm)$/i, "");
+  let i = 0;
+  for (;;) {
+    const stem = i === 0 ? base : `${base}_${i}`;
+    i++;
+    const outPath = path.join(dir, stem + ext);
+    const partPath = path.join(dir, stem + ".part" + ext);
+    if (fs.existsSync(outPath)) continue;
+    try {
+      fs.closeSync(fs.openSync(partPath, "wx")); // exclusive create — claim the name
+    } catch (e) {
+      if (e.code === "EEXIST") continue;
+      throw e;
+    }
+    if (fs.existsSync(outPath)) {
+      try { fs.rmSync(partPath, { force: true }); } catch { }
+      continue;
+    }
+    return { outPath, partPath };
+  }
 }
 function run(cmd, args) {
   return new Promise((resolve, reject) => {
@@ -144,41 +185,85 @@ async function faststart(file) {
 
 /* ── Fast export sessions ──
    The browser renders frames with its own compositor and streams them here as
-   JPEGs; ffmpeg encodes them (plus an optional WAV mix) into a real MP4. */
+   JPEGs; a single ffmpeg pass encodes them plus the WAV mix into the final file.
+   ffmpeg is spawned on the FIRST frame, not here: the audio mix is uploaded
+   between /begin and the first frame, and a one-pass encode needs it on disk. */
 const exportSessions = new Map();
-function beginExport(fps, name) {
+async function beginExport(fps, name, profileId, hasAudio) {
+  const profile = resolveProfile(profileId);
+  const dry = await dryRunProfile(profile, { fps, hasAudio });
+  if (!dry.ok) throw new Error(`profile "${profile.id}" was rejected by ffmpeg: ${dry.error}`);
   const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fablecut-"));
-  const videoPath = path.join(dir, "video.mp4");
-  const proc = spawn("ffmpeg", [
-    "-y", "-f", "image2pipe", "-framerate", String(fps), "-i", "-",
-    // The browser's JPEG frames are full-range BT.601 (JFIF). Convert them to
-    // limited-range BT.709 and TAG the stream, otherwise x264 emits bt470bg/pc/
-    // unknown and players do the wrong YUV->RGB conversion — the render comes
-    // out darker than the preview.
-    "-vf", "scale=in_range=full:in_color_matrix=bt601:out_range=tv:out_color_matrix=bt709",
-    "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
-    "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
-    "-color_range", "tv",
-    videoPath,
-  ], { stdio: ["pipe", "ignore", "pipe"] });
-  let stderr = "";
-  proc.stderr.on("data", (d) => { stderr = (stderr + d).slice(-2000); });
-  proc.stdin.on("error", () => {}); // EPIPE if ffmpeg dies mid-stream; surfaced via exit code
+  const safe = safeName(name || "export");
+  // Reserve the output name now (not at first frame) so concurrent exports
+  // cannot both see the same free path. The empty .part file is overwritten by ffmpeg (-y).
+  const { outPath, partPath } = reserveExportPaths(EXPORTS_DIR, safe, profile.extension);
   const sess = {
-    proc, dir, videoPath, name: safeName(name || "export"),
-    wav: null, err: () => stderr,
-    done: new Promise((res) => proc.on("close", res)),
+    proc: null, fps, profile, name: safe, hasAudio: !!hasAudio,
+    dir: fs.mkdtempSync(path.join(os.tmpdir(), "fablecut-")),
+    wav: null, partPath, outPath,
+    stderr: "", done: null,
+    // ffmpeg's complaint is in the last lines; the rest is progress noise
+    err: () => sess.stderr.trim().split("\n").filter(Boolean).slice(-3)
+      .map((l) => l.trim()).join(" · "),
   };
   exportSessions.set(id, sess);
-  return id;
+  return { id, profile: profile.id, label: profile.label, summary: profileSummary(profile) };
+}
+/* Encode into the paths reserved at /begin; rename .part → final on clean exit
+   so an aborted render never leaves something that looks like a finished file. */
+function startEncoder(sess) {
+  const proc = spawn("ffmpeg", buildExportArgs(sess.profile, {
+    fps: sess.fps, wavPath: sess.wav, outPath: sess.partPath,
+  }), { stdio: ["pipe", "ignore", "pipe"] });
+  proc.stderr.on("data", (d) => { sess.stderr = (sess.stderr + d).slice(-2000); });
+  // EPIPE on end()/late writes is normal once ffmpeg has exited; writeExportFrame
+  // attaches its own error listener while a backpressured write is in flight.
+  proc.stdin.on("error", () => { });
+  sess.proc = proc;
+  sess.done = new Promise((res) => proc.on("close", res));
+  return proc;
+}
+/** Write one JPEG frame to ffmpeg stdin. If the pipe is full, wait for drain —
+ *  but also reject if ffmpeg exits or the stdin errors, so the HTTP request
+ *  cannot hang forever after a failed encode. */
+function writeExportFrame(sess, body) {
+  const proc = sess.proc;
+  return new Promise((resolve, reject) => {
+    if (!proc || proc.exitCode !== null || proc.killed)
+      return reject(new Error("ffmpeg exited: " + sess.err()));
+
+    let settled = false;
+    const finish = (fn, arg) => {
+      if (settled) return;
+      settled = true;
+      proc.off("close", onClose);
+      proc.stdin.off("error", onErr);
+      proc.stdin.off("drain", onDrain);
+      fn(arg);
+    };
+    const onClose = () => finish(reject, new Error("ffmpeg exited: " + (sess.err() || "closed")));
+    const onErr = (e) => finish(reject, new Error(e?.message || "ffmpeg stdin error"));
+    const onDrain = () => finish(resolve);
+
+    proc.once("close", onClose);
+    proc.stdin.once("error", onErr);
+    let ok;
+    try { ok = proc.stdin.write(body); }
+    catch (e) { return finish(reject, e); }
+    if (proc.exitCode !== null)
+      return finish(reject, new Error("ffmpeg exited: " + sess.err()));
+    if (ok) finish(resolve);
+    else proc.stdin.once("drain", onDrain);
+  });
 }
 function cleanupExport(id) {
   const s = exportSessions.get(id);
   if (!s) return;
   exportSessions.delete(id);
-  try { s.proc.kill(); } catch {}
+  try { s.proc?.kill(); } catch {}
   try { fs.rmSync(s.dir, { recursive: true, force: true }); } catch {}
+  if (s.partPath) try { fs.rmSync(s.partPath, { force: true }); } catch {}
 }
 
 /* Static file with HTTP Range support (required for <video> seeking) */
@@ -304,32 +389,52 @@ const server = http.createServer(async (req, res) => {
     sendJSON(res, 200, { available: HAS_FFMPEG });
     return;
   }
-  if (p === "/api/export/begin" && req.method === "POST") {
-    if (!HAS_FFMPEG) { sendJSON(res, 400, { error: "ffmpeg not found on PATH" }); return; }
+  if (p === "/api/export/profiles" && req.method === "GET") {
     try {
-      const opts = JSON.parse((await readBody(req)).toString("utf8") || "{}");
-      sendJSON(res, 200, { id: beginExport(opts.fps || 30, opts.name) });
+      const detail = url.searchParams.get("detail") === "1";
+      sendJSON(res, 200, listProfilesPublic(detail));
     } catch (e) { sendJSON(res, 500, { error: String(e) }); }
     return;
   }
+  if (p === "/api/export/begin" && req.method === "POST") {
+    try {
+      const opts = JSON.parse((await readBody(req)).toString("utf8") || "{}");
+      if (opts.profile) resolveProfile(opts.profile); // 400, not 500, on a bad id — even without ffmpeg
+      if (!HAS_FFMPEG) { sendJSON(res, 400, { error: "ffmpeg not found on PATH" }); return; }
+      sendJSON(res, 200, await beginExport(opts.fps || 30, opts.name, opts.profile, opts.hasAudio !== false));
+    } catch (e) {
+      // an unusable profile is the caller's problem, not a server fault
+      const bad = /^Unknown encoding profile|was rejected by ffmpeg/.test(e.message || "");
+      sendJSON(res, bad ? 400 : 500, { error: String(e.message || e) });
+    }
+    return;
+  }
   if (p === "/api/export/frame" && req.method === "POST") {
-    const sess = exportSessions.get(url.searchParams.get("id"));
+    const id = url.searchParams.get("id");
+    const sess = exportSessions.get(id);
     if (!sess) { sendJSON(res, 404, { error: "no such export session" }); return; }
     try {
       const body = await readBody(req);
-      if (sess.proc.exitCode !== null) throw new Error("ffmpeg exited: " + sess.err());
-      if (!sess.proc.stdin.write(body))
-        await new Promise((r) => sess.proc.stdin.once("drain", r));
+      if (sess.hasAudio && !sess.wav) {
+        sendJSON(res, 409, { error: "audio mix has not been uploaded yet" });
+        return;
+      }
+      if (!sess.proc) startEncoder(sess);
+      await writeExportFrame(sess, body);
       sendJSON(res, 200, { ok: true });
-    } catch (e) { sendJSON(res, 500, { error: String(e) }); }
+    } catch (e) {
+      cleanupExport(id);
+      sendJSON(res, 500, { error: String(e.message || e) });
+    }
     return;
   }
   if (p === "/api/export/audio" && req.method === "POST") {
     const sess = exportSessions.get(url.searchParams.get("id"));
     if (!sess) { sendJSON(res, 404, { error: "no such export session" }); return; }
     try {
-      sess.wav = path.join(sess.dir, "audio.wav");
-      fs.writeFileSync(sess.wav, await readBody(req));
+      const wavPath = path.join(sess.dir, "audio.wav");
+      fs.writeFileSync(wavPath, await readBody(req));
+      sess.wav = wavPath;
       sendJSON(res, 200, { ok: true });
     } catch (e) { sendJSON(res, 500, { error: String(e) }); }
     return;
@@ -340,21 +445,13 @@ const server = http.createServer(async (req, res) => {
     if (!sess) { sendJSON(res, 404, { error: "no such export session" }); return; }
     try {
       if (url.searchParams.get("discard")) { cleanupExport(id); sendJSON(res, 200, { ok: true }); return; }
+      if (!sess.proc) throw new Error("no frames were uploaded");
       sess.proc.stdin.end();
       const code = await sess.done;
       if (code !== 0) throw new Error("ffmpeg encode failed: " + sess.err());
-      const out = uniquePath(EXPORTS_DIR, sess.name.replace(/\.mp4$/i, "") + ".mp4");
-      // Re-assert the bt709 tags on the mux — a stream-copy pass can drop the
-      // container-level colr atom even though the SPS still carries them.
-      const TAGS = ["-colorspace", "bt709", "-color_primaries", "bt709",
-                    "-color_trc", "bt709", "-color_range", "tv"];
-      if (sess.wav && fs.existsSync(sess.wav))
-        await run("ffmpeg", ["-y", "-i", sess.videoPath, "-i", sess.wav,
-          "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest",
-          ...TAGS, "-movflags", "+faststart", out]);
-      else
-        await run("ffmpeg", ["-y", "-i", sess.videoPath, "-c", "copy",
-          ...TAGS, "-movflags", "+faststart", out]);
+      const out = sess.outPath;
+      fs.renameSync(sess.partPath, out);
+      sess.partPath = null; // renamed — cleanup must not delete the finished file
       cleanupExport(id);
       sendJSON(res, 200, { ok: true, src: "/exports/" + encodeURIComponent(path.basename(out)) });
     } catch (e) { cleanupExport(id); sendJSON(res, 500, { error: String(e) }); }
@@ -441,5 +538,9 @@ server.listen(PORT, HOST, () => {
   console.log(`  media folder : ${MEDIA_DIR}`);
   console.log(`  library      : ${LIBRARY_DIR} (${LIBRARY_SUBDIRS.join(", ")})`);
   if (DATA_DIR !== APP_DIR) console.log(`  app files    : ${APP_DIR}`);
-  console.log(`  ffmpeg       : ${HAS_FFMPEG ? "found (fast export + faststart remux on)" : "not found (real-time export only)"}\n`);
+  console.log(`  ffmpeg       : ${HAS_FFMPEG ? "found (fast export + faststart remux on)" : "not found (real-time export only)"}`);
+  const enc = loadEncodeProfiles(true);
+  console.log(`  encode prof. : ${PROFILES_FILE} (${Object.keys(enc.profiles).join(", ")} · default ${enc.default})`);
+  for (const issue of enc.issues || []) console.log(`     ⚠ ${issue}`);
+  console.log("");
 });

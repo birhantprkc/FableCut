@@ -24,6 +24,8 @@ Every Claude Code session then has these tools:
 - `fablecut_import_media` — copy a local file into `./media/` and register it.
 - `fablecut_analyze_reference` — turn a reference video into an edit blueprint
   (shots, beats, BPM, energy, drop) + extract its music. See "Remake a reference video".
+- `fablecut_encode_profiles` — list export presets from `encoding-profiles.json` (each is a
+  raw ffmpeg args list). Set `project.encodeProfile` via patch to pin a project default.
 
 ### Token-efficient editing (important for agents)
 
@@ -184,6 +186,7 @@ Examples in `library/svg/`: `sparkles.svg` (loop), `lower-third.svg`,
   ],
   "disabledTracks": [ "A2" ],
   // ^ optional — track ids (V4 V3 V2 V1 A1 A2 A3) omitted from preview/export when listed
+  "encodeProfile": "hq",  // optional — fast-export profile id (see encoding-profiles.json)
   "media": [
     { "id": "m_abc", "name": "intro.mp4", "kind": "video",  // video|audio|image|svg
       "src": "/media/intro.mp4",             // path under ./media or ./library
@@ -427,10 +430,16 @@ obvious cuts were missed, raise it if motion is being misread as cuts.
 - `POST /api/analyze` — body `{src:"/media/ref.mp4", threshold?, music?}`: analyze a
   reference video into an edit blueprint (see "Remake a reference video"); extracts
   its music into ./media. `GET /api/analyze?src=…` returns the cached blueprint.
-- `GET  /api/events`  — SSE, emits `change` when project.json, ./media or ./library changes
+- `GET  /api/events`  — SSE: named event `change` when project.json, ./media or
+  ./library changes; named event `profiles` when `encoding-profiles.json` changes
+  (UI refreshes the export-profile list only — no project reload)
 - Fast export (used by the UI; browser renders frames, ffmpeg encodes):
-  `GET /api/export/ffmpeg` → `{available}` · `POST /api/export/begin` `{fps,name}` → `{id}`
-  · `POST /api/export/frame?id=` (JPEG body, in order) · `POST /api/export/audio?id=` (WAV body)
+  `GET /api/export/ffmpeg` → `{available}` · `GET /api/export/profiles[?detail=1]` →
+  `{default, profiles, issues}` · `POST /api/export/begin` `{fps,name,profile?,hasAudio?}` →
+  `{id,profile,label,summary}` (**400** if `profile` is not a defined id, or if ffmpeg
+  rejects its args in the dry run)
+  · `POST /api/export/frame?id=` (JPEG body, in order) · `POST /api/export/audio?id=` (WAV
+  body — must be sent before the first frame; ffmpeg is spawned on frame 1)
   · `POST /api/export/end?id=[&discard=1]` → `{src}` under `/exports/`
 
 ## Recipes
@@ -555,8 +564,78 @@ Realtime export, and `/api/export/begin` all use this value; pass the same
 
 Export is user-driven (Export button → dialog). Two engines: **Fast** (browser
 renders each frame with the normal compositor — including SVG frames, keys and
-AI masks — streams JPEG frames + an offline WAV mix to the server, ffmpeg
-encodes a CRF-18 faststart MP4 into `./exports/`) and **Realtime**
+AI masks — streams JPEG frames + an offline WAV mix to the server, a single ffmpeg
+pass encodes them via an **encoding profile** into `./exports/`) and **Realtime**
 (MediaRecorder fallback). Claude cannot trigger export headlessly — the
 compositor lives in the browser; ask the user to click Export, or render with
 ffmpeg directly from `media/` sources if a file is needed.
+
+### Encoding profiles (`encoding-profiles.json`)
+
+User-editable at the repo root. A profile is a **raw ffmpeg argument list** plus the
+things that are not ffmpeg arguments: `jpegQuality` (browser frame quality),
+`extension` (output container), and optional `color` (output matrix / range tags).
+Edit the file while the server runs — the UI hot-reloads the profile list via an SSE
+`profiles` event (no full project reload).
+
+```jsonc
+{
+  "default": "delivery",           // profile id used when nothing else is set
+  "profiles": {
+    "draft": {
+      "label": "Draft · H.264 fast",
+      "description": "Quick preview — smaller file, faster encode.",
+      "jpegQuality": 0.85,         // browser JPEG frame quality (0.1–1)
+      "extension": ".mp4",
+      // Output color (optional — defaults to BT.709 limited/tv). Independent of
+      // -pix_fmt: yuv420p and yuv422p10le both typically use bt709 for HD SDR.
+      "color": { "matrix": "bt709", "primaries": "bt709", "trc": "bt709", "range": "tv" },
+      "args": ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+               "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+               "-movflags", "+faststart", "-shortest"]
+    }
+  }
+}
+```
+
+Export is **one ffmpeg pass**. The server owns the input side and the output path;
+`args` is everything in between (plus JPEG color conversion derived from `color`):
+
+```
+ffmpeg -y -f image2pipe -framerate <fps> -i -  [-i audio.wav]  <jpeg-color> <args…>  exports/<name><extension>
+```
+
+- **There is no allow-list.** Any codec, filter, container or flag your local ffmpeg
+  supports works — ProRes, DNxHD, NVENC/QSV/VideoToolbox, VP9/AV1, 10-bit, HDR tags.
+  See the shipped `prores422` and `broadcast1080i50` profiles.
+- **Args are validated by ffmpeg itself**, not by a schema: when an export starts the
+  server dry-runs the profile against a 0.1 s synthetic input (`lavfi`). A typo or an
+  encoder your build lacks is rejected up front with ffmpeg's own message, instead of
+  failing after every frame has been rendered.
+- Use the **array form** — each element is passed to `spawn` untouched, so no quoting
+  is needed (`["-vf", "drawtext=text='hi there'"]` just works). A plain string is
+  accepted and split on whitespace.
+- **`color`** controls JPEG→YUV conversion and stream tags (`-colorspace` /
+  `-color_primaries` / `-color_trc` / `-color_range`). Default is BT.709 limited
+  (`range: "tv"`). Use `"range": "pc"` for full-range masters. Do **not** put those
+  flags in `args` — the engine strips them and applies `color` so vf and tags stay
+  aligned. `-pix_fmt` stays in `args` (sampling / bit depth only).
+- Nothing else is injected for you: `+faststart`, `-shortest`, `-strict -2` for Opus
+  in MP4 and pixel-format choices are all yours to write.
+- Frames arrive as **JPEG (4:2:0)**, so `yuv422p`/`yuv444p` cannot recover chroma the
+  source never had; raise `jpegQuality` before reaching for a wider pixel format.
+- The audio mix is only present when the timeline has audio; with no audio there is a
+  single input, so avoid hardcoded `-map 1:a`.
+
+**Note:** Fast export pipes **composited JPEG frames** from the browser (`-f image2pipe`),
+not `-i source.mp4`. Filters and codec settings apply to that frame stream. To transcode
+an existing file verbatim, run ffmpeg directly — that is outside the compositor path.
+
+**Which profile is used (priority):**
+1. Profile picked in the Export dialog (one-off; saved to browser settings unless overridden)
+2. `project.encodeProfile` — set via UI reload or `{op:"setProject", set:{encodeProfile:"hq"}}`
+3. Browser setting `encodeProfile` in localStorage (set when you change the Export dropdown)
+4. `default` in `encoding-profiles.json`
+
+**MCP:** `fablecut_encode_profiles` lists profiles; `{detail:true}` includes each `args`
+array; `{profile:"hq"}` returns one profile. `fablecut_status` shows the effective profile.

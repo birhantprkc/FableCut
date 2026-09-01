@@ -173,6 +173,12 @@
       <input type="radio" name="engine" id="engineRealtime">
       <span><b>Realtime (in-browser)</b><br><span class="dim">Plays the timeline once and records it. Keep the tab focused.</span></span>
     </label>
+    <div class="export-profile-row" id="exportProfileRow">
+      <label class="export-profile-label" for="exportProfileSel">Encoding profile</label>
+      <select class="export-profile-sel" id="exportProfileSel" aria-describedby="exportProfileNote exportProfileHint"></select>
+      <p class="dim export-profile-note" id="exportProfileNote"></p>
+      <p class="dim export-profile-hint" id="exportProfileHint"></p>
+    </div>
     <div class="export-track-warn hidden" id="exportTrackWarn" role="status"></div>
     <div class="dialog-actions">
       <button class="btn" id="btnCancelSetup">Cancel</button>

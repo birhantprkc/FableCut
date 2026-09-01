@@ -104,6 +104,37 @@ test("GET /api/export/ffmpeg reports encoder availability", async (t) => {
   assert.equal(typeof body.available, "boolean");
 });
 
+test("POST /api/export/begin validates the encoding profile", async (t) => {
+  const { base } = await boot(t);
+
+  const listed = await (await fetch(base + "/api/export/profiles")).json();
+  assert.ok(listed.profiles.delivery, "GET /api/export/profiles must list the shipped delivery profile");
+  assert.equal(listed.profiles.delivery.args, undefined, "the compact listing omits args");
+
+  const unknown = await fetch(base + "/api/export/begin", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ fps: 30, name: "t", profile: "no-such-profile", hasAudio: false }),
+  });
+  assert.equal(unknown.status, 400, "an unknown profile id is a client error, not a 500");
+  const unknownBody = await unknown.json();
+  assert.match(unknownBody.error, /Unknown encoding profile/i);
+
+  const ffmpeg = await (await fetch(base + "/api/export/ffmpeg")).json();
+  if (!ffmpeg.available) return;
+
+  const ok = await fetch(base + "/api/export/begin", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ fps: 30, name: "profile-test", profile: "draft", hasAudio: false }),
+  });
+  const body = await ok.json();
+  assert.equal(ok.status, 200, body.error);
+  assert.equal(body.profile, "draft");
+  assert.ok(body.id, "a valid profile starts a session");
+  const end = await fetch(base + "/api/export/end?id=" + encodeURIComponent(body.id) + "&discard=1",
+    { method: "POST" });
+  assert.equal(end.status, 200);
+});
+
 test("the app shell and its assets are served", async (t) => {
   const { base } = await boot(t);
   const index = await fetch(base + "/");

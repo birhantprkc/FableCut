@@ -46,8 +46,13 @@ It remains **not** hardened for untrusted networks or multi-tenant use:
 
 - The REST API (`/api/*`) has no authentication — anyone who can reach the port
   can read and overwrite `project.json` and upload files into `media/`.
-- The server reads and writes files under the project directory and shells out to
-  `ffmpeg` for export/remux.
+- The server reads and writes files under the project directory and spawns
+  `ffmpeg` for export/remux. Fast-export profiles in `encoding-profiles.json`
+  (hot-reloaded) are raw ffmpeg argument lists: the browser sends only a
+  profile id, args are passed to `spawn` with no shell, and a dry-run rejects
+  bad args before any frames are rendered. That is expected in the local
+  single-user model — anyone who can edit that file can already run ffmpeg on
+  the machine.
 - Do not expose the port publicly. If you must, put it behind your own
   authentication and network controls.
 

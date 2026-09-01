@@ -81,7 +81,8 @@ test("tools/list advertises well-formed tools", async (t) => {
   // The documented surface must stay present; extra tools are allowed to appear.
   const names = result.tools.map((x) => x.name);
   for (const expected of ["fablecut_status", "fablecut_docs", "fablecut_get_project",
-    "fablecut_set_project", "fablecut_patch_project", "fablecut_import_media"]) {
+    "fablecut_set_project", "fablecut_patch_project", "fablecut_import_media",
+    "fablecut_analyze_reference", "fablecut_encode_profiles"]) {
     assert.ok(names.includes(expected), `missing documented tool ${expected}`);
   }
 });

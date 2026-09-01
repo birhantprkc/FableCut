@@ -149,6 +149,33 @@ test("fablecut_set_project refuses to clobber an edit made behind its back", asy
   assert.ok(after.revision > 7, "a forced save still moves the revision forward");
 });
 
+test("fablecut_encode_profiles lists shipped presets and rejects an unknown id", async (t) => {
+  const { mcp } = await boot(t);
+
+  const listed = await mcp.request("tools/list");
+  const names = listed.result.tools.map((x) => x.name);
+  assert.ok(names.includes("fablecut_encode_profiles"), "tools/list must advertise the new tool");
+
+  const summary = JSON.parse((await mcp.callTool("fablecut_encode_profiles")).text);
+  assert.equal(summary.default, "delivery");
+  assert.ok(summary.profiles.delivery, "the shipped delivery profile must be listed");
+  assert.equal(summary.profiles.delivery.args, undefined, "the compact list omits the ffmpeg args array");
+  assert.ok(summary.profiles.delivery.summary, "the compact list still has a summary string");
+
+  const detailed = JSON.parse((await mcp.callTool("fablecut_encode_profiles", { detail: true })).text);
+  assert.ok(Array.isArray(detailed.profiles.delivery.args), "detail:true includes the args array");
+  assert.ok(detailed.profiles.delivery.args.includes("-c:v"), "shipped args look like ffmpeg flags");
+
+  const one = JSON.parse((await mcp.callTool("fablecut_encode_profiles", { profile: "delivery" })).text);
+  assert.equal(one.profile, "delivery");
+  assert.equal(one.extension, ".mp4");
+  assert.ok(Array.isArray(one.args) && one.args.length, "a known id returns its args");
+
+  const miss = await mcp.callTool("fablecut_encode_profiles", { profile: "no-such-profile" });
+  assert.ok(miss.isError, "an unknown profile id must be flagged isError");
+  assert.match(miss.text, /Unknown encoding profile/i);
+});
+
 test("fablecut_set_project validates the document before writing it", async (t) => {
   const { dir, mcp } = await boot(t);
   const before = readProject(dir);

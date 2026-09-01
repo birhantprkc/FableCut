@@ -176,8 +176,10 @@ same time.
 
 **Export**
 
-- Fast export: browser renders every frame + an offline audio mix, ffmpeg
-  encodes a frame-accurate CRF-18 MP4 (keeps rendering if you switch tabs)
+- Fast export: browser renders every frame + an offline audio mix; ffmpeg
+  encodes them via an **encoding profile** from `encoding-profiles.json`
+  (keeps rendering if you switch tabs). The Export dialog has a profile
+  selector; pin a project default with `encodeProfile` in `project.json`
 - Realtime MediaRecorder fallback when ffmpeg isn't available
 
 ## Quick start
@@ -269,7 +271,8 @@ Three equivalent control surfaces:
 
    Tools: `fablecut_status` (auto-starts the editor), `fablecut_docs`,
    `fablecut_get_project`, `fablecut_set_project`, `fablecut_patch_project`,
-   `fablecut_import_media`, `fablecut_analyze_reference`.
+   `fablecut_import_media`, `fablecut_analyze_reference`,
+   `fablecut_encode_profiles`.
 
    FableCut is also published on the **official MCP registry** as
    [`io.github.ronak-create/fablecut`](https://registry.modelcontextprotocol.io/v0/servers?search=fablecut)
@@ -284,7 +287,7 @@ Three equivalent control surfaces:
 2. **The file** — read `project.json`, modify, bump `revision`, write. The UI
    live-reloads.
 3. **REST** — `GET/PUT /api/project`, `POST /api/upload`, `GET /api/library`,
-   SSE at `/api/events`. See CLAUDE.md for the full list.
+   `GET /api/export/profiles`, SSE at `/api/events`. See CLAUDE.md for the full list.
 
 Example: ask Claude Code *"cut these six clips to the beat markers, add a
 teal-orange grade, put a word-pop caption on top and a whoosh on every cut"* —
@@ -316,6 +319,8 @@ mcp-server.js    stdio MCP server exposing the editor to AI agents
 analyze.js       reference-video analyzer: shots, beats/BPM, energy, drop,
                  music extraction (module + CLI)
 CLAUDE.md        the agent manual (schema + recipes) — also served by fablecut_docs
+encoding-profiles.json
+                 Fast-export ffmpeg presets (hot-reloaded)
 project.json     your timeline (created on first run; gitignored)
 media/           project footage (gitignored)
 analysis/        cached edit blueprints from /api/analyze (gitignored)
