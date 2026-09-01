@@ -979,34 +979,43 @@ body.track-size-s .clip.selected {
 }
 #exportFrameOverlay .ef-shade {
   position: absolute;
-  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.58);
-  border: 2px solid rgba(255, 255, 255, 0.88);
-  box-sizing: border-box;
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.88);
   pointer-events: none;
 }
+#exportFrameOverlay.is-crop .ef-shade {
+  box-shadow: 0 0 0 9999px #000;
+}
+#btnExportFrameDim .ico { margin-right: 0; }
+#btnExportFrameDim .ef-bulb-rays { opacity: 0; }
+#btnExportFrameDim.on .ef-bulb-rays { opacity: 1; }
+#btnExportFrameDim.on .ef-bulb-glass { fill: currentColor; fill-opacity: .22; }
 #exportFrameOverlay .ef-handle {
   position: absolute;
-  display: flex;
+  display: inline-flex;
   align-items: center;
   justify-content: flex-start;
-  height: 22px;
+  width: auto;
+  min-width: 0;
+  height: 20px;
   box-sizing: border-box;
   margin: 0;
-  padding: 0 8px;
-  font: 600 10px/1 "Segoe UI", sans-serif;
+  padding: 0 6px;
+  font: 600 10px/1 ui-sans-serif, system-ui, sans-serif;
   font-family: inherit;
-  letter-spacing: 0.04em;
   text-transform: uppercase;
   color: #fff;
-  background: rgba(79, 140, 255, 0.8);
-  border: 1px solid rgba(255, 255, 255, 0.35);
+  background: color-mix(in srgb, var(--accent) 62%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, #fff);
   border-radius: 4px;
   cursor: move;
   pointer-events: auto;
   touch-action: none;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   user-select: none;
-  transition: background 0.12s ease;
+  transition: background 0.12s ease, filter 0.12s ease;
   appearance: none;
   -webkit-appearance: none;
 }
@@ -1015,11 +1024,11 @@ body.track-size-s .clip.selected {
   outline-offset: 2px;
 }
 #exportFrameOverlay .ef-handle:hover {
-  background: rgba(79, 140, 255, 1);
+  background: color-mix(in srgb, var(--accent) 82%, transparent);
 }
 #exportFrameOverlay.is-dragging .ef-handle,
 #exportFrameOverlay .ef-handle:active {
-  background: rgba(79, 140, 255, 0.9);
+  background: color-mix(in srgb, var(--accent) 72%, transparent);
 }
 #exportFrameOverlay .ef-edge {
   position: absolute;
