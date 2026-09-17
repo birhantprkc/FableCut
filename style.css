@@ -856,6 +856,7 @@ body.track-size-s .clip.selected {
   padding: 5px 2px 4px 5px;
   background: #000a;
   user-select: none;
+  transform-origin: bottom right;
 }
 .vu-channels {
   display: flex;

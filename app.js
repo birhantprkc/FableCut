@@ -518,6 +518,7 @@ const els = {
   safeOverlay: $("safeOverlay"), btnSpeed: $("btnSpeed"),
   monitorStage: $("monitorStage"), monitorScroll: $("monitorScroll"),
   monitorZoomInner: $("monitorZoomInner"), kfGraphs: $("kfGraphs"),
+  vuMeter: $("vuMeter"),
   exportSetup: $("exportSetup"), engineFast: $("engineFast"), engineRealtime: $("engineRealtime"),
   exportProfileRow: $("exportProfileRow"),
   exportProfileSel: $("exportProfileSel"), exportProfileNote: $("exportProfileNote"),
@@ -4548,6 +4549,7 @@ function syncMeterTracksExpandedUI() {
       meterState.lastHold[id] = -1;
     }
   }
+  fitVuMeter();
 }
 function toggleMeterTracksExpanded(ev) {
   if (ev) { ev.preventDefault(); ev.stopPropagation(); }
@@ -4755,6 +4757,29 @@ function buildMeterDOM() {
   root.appendChild(row);
   syncMeterTracksExpandedUI();
 }
+let vuMeterScale = 1;
+/** Fit the VU overlay to the stage with a compositor scale — no canvas resize. */
+function fitVuMeter() {
+  const meter = els.vuMeter;
+  const stage = els.monitorStage;
+  if (!meter || !stage) return;
+  const naturalH = meter.offsetHeight;
+  const naturalW = meter.offsetWidth;
+  if (!naturalH || !naturalW) {
+    if (vuMeterScale !== 1) {
+      vuMeterScale = 1;
+      meter.style.transform = "";
+    }
+    return;
+  }
+  const sx = (stage.clientWidth - 4) / naturalW;
+  const sy = (stage.clientHeight - 12) / naturalH;
+  const next = Math.max(0, Math.min(1, sx, sy));
+  if (Math.abs(next - vuMeterScale) < 0.001) return;
+  vuMeterScale = next;
+  meter.style.transform = next >= 0.999 ? "" : "scale(" + next + ")";
+}
+
 function rmsToDb(rms) {
   return rms > 1e-8 ? 20 * Math.log10(rms) : METER_DB_MIN;
 }
@@ -8065,6 +8090,7 @@ els.monitorScroll.addEventListener("scroll", () => {
 });
 if (typeof ResizeObserver !== "undefined") {
   new ResizeObserver(() => {
+    fitVuMeter();
     if (state.viewZoom <= 1.001) {
       monitorFitCache = null;
       if (state.guides) updateSafeOverlay();
