@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="800" height="450" viewBox="0 0 800 450">
-  <!-- FableCut animated SVG  loops  central AI star + three twinkling satellites (white) -->
+  <!-- FableCut animated SVG Â· loops Â· central AI star + three twinkling satellites (white) -->
   <style>
     .tw { transform-box: fill-box; transform-origin: center;
           animation: twinkle 1.8s ease-in-out infinite; }
