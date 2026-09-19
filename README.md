@@ -358,6 +358,104 @@ library/         default assets: elements/ sfx/ svg/ fonts/
 exports/         finished renders (gitignored)
 ```
 
+## Architecture Overview
+
+```mermaid
+flowchart TD
+
+subgraph group_interaction["Editing Experience"]
+  node_browser_ui["Browser Editor<br/>[app.js]"]
+  node_timeline_model["Timeline Model<br/>[app.js]"]
+  node_ruler_worker["Ruler Worker<br/>[ruler-worker.js]"]
+end
+
+subgraph group_project_media["Project And Media"]
+  node_project_store[("Project Store<br/>[paths.js]")]
+  node_media_store[("Media Store<br/>[paths.js]")]
+  node_asset_library[("Asset Library<br/>[server.js]")]
+  node_url_importer["URL Importer<br/>[import-url.js]"]
+end
+
+subgraph group_agent_api["Agent Control"]
+  node_rest_api["REST Server<br/>[server.js]"]
+  node_mcp_server["MCP Server<br/>[mcp-server.js]"]
+  node_sse_hub["Change Notifications<br/>[server.js]"]
+end
+
+subgraph group_playback_export["Playback And Export"]
+  node_compositor["Canvas Compositor<br/>[app.js]"]
+  node_audio_engine["Audio Engine<br/>[app.js]"]
+  node_audio_meter["Audio Meter<br/>[meter-worklet.js]"]
+  node_export_engine["Export Engine<br/>[server.js]"]
+  node_encoding_profiles["Encoding Profiles<br/>[encode-profiles.js]"]
+end
+
+subgraph group_analysis["Analysis Tools"]
+  node_reference_analyzer["Reference Analyzer<br/>[analyze.js]"]
+end
+
+node_human(("Human Editor"))
+node_ai_agent(("AI Agent"))
+node_ffmpeg["FFmpeg"]
+
+node_human -->|"edits timeline"| node_browser_ui
+node_ai_agent -->|"sends tools"| node_mcp_server
+node_browser_ui -->|"updates project"| node_timeline_model
+node_timeline_model -->|"persists JSON"| node_project_store
+node_browser_ui -->|"calls REST"| node_rest_api
+node_rest_api -->|"reads writes"| node_project_store
+node_rest_api -->|"serves media"| node_media_store
+node_rest_api -->|"lists assets"| node_asset_library
+node_mcp_server -->|"checks server"| node_rest_api
+node_mcp_server -->|"patches project"| node_project_store
+node_mcp_server -->|"imports media"| node_url_importer
+node_url_importer -->|"stores downloads"| node_media_store
+node_rest_api -->|"downloads URLs"| node_url_importer
+node_rest_api -->|"broadcasts changes"| node_sse_hub
+node_sse_hub -->|"pushes changes"| node_browser_ui
+node_timeline_model -->|"renders timeline"| node_compositor
+node_timeline_model -->|"routes clips"| node_audio_engine
+node_audio_engine -->|"measures audio"| node_audio_meter
+node_browser_ui -->|"uploads frames"| node_rest_api
+node_rest_api -->|"streams export"| node_export_engine
+node_export_engine -->|"loads profile"| node_encoding_profiles
+node_export_engine -->|"encodes video"| node_ffmpeg
+node_reference_analyzer -->|"analyzes media"| node_ffmpeg
+node_reference_analyzer -->|"writes music"| node_media_store
+node_ai_agent -.->|"requests analysis"| node_reference_analyzer
+node_browser_ui -.->|"draws ruler"| node_ruler_worker
+
+click node_browser_ui "https://github.com/ronak-create/fablecut/blob/main/app.js"
+click node_timeline_model "https://github.com/ronak-create/fablecut/blob/main/app.js"
+click node_compositor "https://github.com/ronak-create/fablecut/blob/main/app.js"
+click node_audio_engine "https://github.com/ronak-create/fablecut/blob/main/app.js"
+click node_audio_meter "https://github.com/ronak-create/fablecut/blob/main/meter-worklet.js"
+click node_rest_api "https://github.com/ronak-create/fablecut/blob/main/server.js"
+click node_mcp_server "https://github.com/ronak-create/fablecut/blob/main/mcp-server.js"
+click node_sse_hub "https://github.com/ronak-create/fablecut/blob/main/server.js"
+click node_project_store "https://github.com/ronak-create/fablecut/blob/main/paths.js"
+click node_media_store "https://github.com/ronak-create/fablecut/blob/main/paths.js"
+click node_asset_library "https://github.com/ronak-create/fablecut/blob/main/server.js"
+click node_url_importer "https://github.com/ronak-create/fablecut/blob/main/import-url.js"
+click node_export_engine "https://github.com/ronak-create/fablecut/blob/main/server.js"
+click node_encoding_profiles "https://github.com/ronak-create/fablecut/blob/main/encode-profiles.js"
+click node_reference_analyzer "https://github.com/ronak-create/fablecut/blob/main/analyze.js"
+click node_ruler_worker "https://github.com/ronak-create/fablecut/blob/main/ruler-worker.js"
+
+classDef toneNeutral fill:#f8fafc,stroke:#334155,stroke-width:1.5px,color:#0f172a
+classDef toneBlue fill:#dbeafe,stroke:#2563eb,stroke-width:1.5px,color:#172554
+classDef toneAmber fill:#fef3c7,stroke:#d97706,stroke-width:1.5px,color:#78350f
+classDef toneMint fill:#dcfce7,stroke:#16a34a,stroke-width:1.5px,color:#14532d
+classDef toneRose fill:#ffe4e6,stroke:#e11d48,stroke-width:1.5px,color:#881337
+classDef toneIndigo fill:#e0e7ff,stroke:#4f46e5,stroke-width:1.5px,color:#312e81
+classDef toneTeal fill:#ccfbf1,stroke:#0f766e,stroke-width:1.5px,color:#134e4a
+class node_browser_ui,node_timeline_model,node_ruler_worker toneBlue
+class node_project_store,node_media_store,node_asset_library,node_url_importer toneAmber
+class node_rest_api,node_mcp_server,node_sse_hub toneMint
+class node_compositor,node_audio_engine,node_audio_meter,node_export_engine,node_encoding_profiles toneRose
+class node_reference_analyzer,node_human,node_ai_agent,node_ffmpeg toneIndigo
+```
+
 ## Authoring animated SVG overlays
 
 SVGs animate with plain CSS `@keyframes`. One convention: never hardcode
